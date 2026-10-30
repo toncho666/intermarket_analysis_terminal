@@ -1,0 +1,68 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-mono: 'JetBrains Mono', monospace;
+  
+  --color-surface-0: #000000;
+  --color-surface-1: #0a0a0a;
+  --color-surface-2: #111111;
+  --color-surface-3: #1a1a1a;
+  --color-surface-4: #222222;
+  --color-surface-5: #2a2a2a;
+  
+  --color-accent-blue: #007AFF;
+  --color-accent-green: #30D158;
+  --color-accent-red: #FF453A;
+  --color-accent-orange: #FF9F0A;
+  --color-accent-purple: #BF5AF2;
+  --color-accent-teal: #64D2FF;
+  --color-accent-yellow: #FFD60A;
+}
+
+/* Base styles */
+* {
+  box-sizing: border-box;
+}
+
+html {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+html.dark {
+  color-scheme: dark;
+}
+
+html.light {
+  color-scheme: light;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+}
+
+/* Scrollbar styles */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #333;
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #555;
+}
+
+/* Recharts overrides */
+.recharts-tooltip-wrapper {
+  outline: none !important;
+}
