@@ -1,202 +1,209 @@
-"""
-Telegram notification service
-- Send alerts to Telegram chat
-- Format messages with Markdown
-- Handle rate limiting
-"""
-import logging
-from typing import Optional, Dict, Any
-from datetime import datetime
+import httpx
+from typing import Optional
+import structlog
+from app.config import settings
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger()
 
 
 class TelegramService:
-    """Service for sending notifications via Telegram"""
+    """Service for sending Telegram notifications."""
     
-    def __init__(self, bot_token: Optional[str] = None, chat_id: Optional[str] = None):
-        self.bot_token = bot_token
-        self.chat_id = chat_id
-        self.bot = None
-        
-        if bot_token:
-            try:
-                from telegram import Bot
-                self.bot = Bot(token=bot_token)
-                logger.info("Telegram bot initialized")
-            except Exception as e:
-                logger.error(f"Failed to initialize Telegram bot: {e}")
+    def __init__(self):
+        self.bot_token = settings.TELEGRAM_BOT_TOKEN
+        self.chat_id = settings.TELEGRAM_CHAT_ID
+        self.base_url = f"https://api.telegram.org/bot{self.bot_token}" if self.bot_token else None
     
     async def send_message(
         self,
-        text: str,
-        parse_mode: str = "Markdown",
-        disable_notification: bool = False
+        message: str,
+        chat_id: Optional[str] = None,
+        parse_mode: str = "HTML"
     ) -> bool:
         """
-        Send a text message to Telegram
+        Send a message to Telegram chat.
+        
+        Args:
+            message: Message text (supports HTML formatting)
+            chat_id: Target chat ID (defaults to configured chat_id)
+            parse_mode: 'HTML' or 'Markdown'
+        
+        Returns:
+            True if sent successfully
         """
-        if not self.bot or not self.chat_id:
-            logger.warning("Telegram bot not configured")
+        if not self.base_url:
+            logger.warning("Telegram bot token not configured")
+            return False
+        
+        target_chat_id = chat_id or self.chat_id
+        if not target_chat_id:
+            logger.warning("No chat_id configured or provided")
             return False
         
         try:
-            await self.bot.send_message(
-                chat_id=self.chat_id,
-                text=text,
-                parse_mode=parse_mode,
-                disable_notification=disable_notification,
-            )
-            logger.info(f"Telegram message sent to {self.chat_id}")
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    f"{self.base_url}/sendMessage",
+                    json={
+                        "chat_id": target_chat_id,
+                        "text": message,
+                        "parse_mode": parse_mode,
+                        "disable_web_page_preview": True
+                    },
+                    timeout=10.0
+                )
+                response.raise_for_status()
+                
+            logger.info("Telegram message sent", chat_id=target_chat_id)
             return True
+            
         except Exception as e:
-            logger.error(f"Failed to send Telegram message: {e}")
+            logger.error("Failed to send Telegram message", error=str(e))
             return False
     
-    async def send_alert(
+    async def send_anomaly_alert(
         self,
-        anomaly_type: str,
         asset_a: str,
         asset_b: str,
+        anomaly_type: str,
         z_score: float,
         severity: str,
-        detected_at: datetime
+        detected_at: str
     ) -> bool:
-        """
-        Send formatted anomaly alert
-        """
+        """Send anomaly detection alert."""
         emoji = {
             'critical': '🔴',
             'high': '🟠',
             'medium': '🟡',
-            'low': '🟢',
+            'low': '🟢'
         }.get(severity, '⚪')
         
-        type_emoji = {
-            'corr_break': '📊',
-            'coint_break': '🔗',
-            'divergence': '↔️',
-            'vol_spike': '📈',
-            'spread_outlier': '📉',
-        }.get(anomaly_type, '⚠️')
-        
         message = f"""
-{emoji} *{severity.upper()} ANOMALY DETECTED* {emoji}
+{emoji} <b>Anomaly Detected</b>
 
-{type_emoji} *Type:* {anomaly_type.replace('_', ' ').title()}
-📌 *Pair:* {asset_a} × {asset_b}
-📊 *Z-Score:* {z_score:.2f}σ
-🕐 *Detected:* {detected_at.strftime('%Y-%m-%d %H:%M UTC')}
+<b>Pair:</b> {asset_a} × {asset_b}
+<b>Type:</b> {anomaly_type.replace('_', ' ').title()}
+<b>Z-Score:</b> {z_score:.2f}σ
+<b>Severity:</b> {severity.upper()}
+<b>Time:</b> {detected_at}
 
-_Action required: Review correlation structure_
-"""
+<i>Intermarket Analysis Terminal</i>
+""".strip()
         
-        return await self.send_message(message.strip())
+        return await self.send_message(message)
     
-    async def send_regime_change(
+    async def send_regime_change_alert(
         self,
-        old_regime: str,
-        new_regime: str,
-        score: float,
-        components: list
+        from_regime: str,
+        to_regime: str,
+        score: float
     ) -> bool:
-        """
-        Send regime change notification
-        """
-        emoji = '🟢' if new_regime == 'Risk-On' else '🔴' if new_regime == 'Risk-Off' else '🟡'
-        
-        component_text = "\n".join([
-            f"  • {c['name']}: {c['value']:.3f} → {c['signal']}"
-            for c in components[:5]
-        ])
+        """Send regime change alert."""
+        emoji = '🟢' if to_regime == 'Risk-On' else ('🔴' if to_regime == 'Risk-Off' else '🟡')
         
         message = f"""
-{emoji} *REGIME CHANGE DETECTED* {emoji}
+{emoji} <b>Regime Change Detected</b>
 
-📊 *New Regime:* {new_regime}
-📈 *Score:* {score:.1f}/100
+<b>From:</b> {from_regime}
+<b>To:</b> {to_regime}
+<b>Score:</b> {score:.1f}/100
 
-*Components:*
-{component_text}
-
-_Review portfolio positioning_
-"""
+<i>Intermarket Analysis Terminal</i>
+""".strip()
         
-        return await self.send_message(message.strip())
+        return await self.send_message(message)
     
-    async def send_backtest_complete(
+    async def send_correlation_break_alert(
+        self,
+        asset_a: str,
+        asset_b: str,
+        current_corr: float,
+        previous_corr: float,
+        window: int
+    ) -> bool:
+        """Send correlation break alert."""
+        delta = current_corr - previous_corr
+        direction = "📈" if delta > 0 else "📉"
+        
+        message = f"""
+{direction} <b>Correlation Break</b>
+
+<b>Pair:</b> {asset_a} × {asset_b}
+<b>Window:</b> {window}D
+<b>Previous:</b> {previous_corr:.3f}
+<b>Current:</b> {current_corr:.3f}
+<b>Change:</b> {delta:+.3f}
+
+<i>Intermarket Analysis Terminal</i>
+""".strip()
+        
+        return await self.send_message(message)
+    
+    async def send_backtest_complete_alert(
         self,
         strategy_name: str,
         sharpe: float,
         total_return: float,
         max_drawdown: float
     ) -> bool:
-        """
-        Send backtest completion notification
-        """
+        """Send backtest completion alert."""
         emoji = '✅' if sharpe > 1 else '⚠️'
         
         message = f"""
-{emoji} *BACKTEST COMPLETED*
+{emoji} <b>Backtest Complete</b>
 
-📋 *Strategy:* {strategy_name}
-📊 *Sharpe Ratio:* {sharpe:.2f}
-💰 *Total Return:* {total_return:+.2f}%
-📉 *Max Drawdown:* {max_drawdown:.2f}%
+<b>Strategy:</b> {strategy_name}
+<b>Sharpe:</b> {sharpe:.2f}
+<b>Return:</b> {total_return:+.1f}%
+<b>Max DD:</b> {max_drawdown:.1f}%
 
-_View full results in dashboard_
-"""
+<i>Intermarket Analysis Terminal</i>
+""".strip()
         
-        return await self.send_message(message.strip())
+        return await self.send_message(message)
     
     async def send_daily_summary(
         self,
-        regime: str,
-        score: float,
-        n_anomalies: int,
+        regime_score: float,
+        regime_label: str,
+        num_anomalies: int,
         top_movers: list
     ) -> bool:
-        """
-        Send daily market summary
-        """
-        emoji = '🟢' if regime == 'Risk-On' else '🔴' if regime == 'Risk-Off' else '🟡'
-        
+        """Send daily market summary."""
         movers_text = "\n".join([
-            f"  • {m['ticker']}: {m['change_pct']:+.2f}%"
+            f"  • {m['ticker']}: {m['change']:+.2f}%"
             for m in top_movers[:5]
         ])
         
+        emoji = '🟢' if regime_score >= 70 else ('🔴' if regime_score < 40 else '🟡')
+        
         message = f"""
-📊 *DAILY MARKET SUMMARY*
+{emoji} <b>Daily Market Summary</b>
 
-{emoji} *Regime:* {regime} (Score: {score:.0f}/100)
-⚠️ *Active Anomalies:* {n_anomalies}
+<b>Regime:</b> {regime_label} ({regime_score:.0f}/100)
+<b>Anomalies:</b> {num_anomalies}
 
-*Top Movers:*
+<b>Top Movers:</b>
 {movers_text}
 
-_Have a great trading day!_
-"""
+<i>Intermarket Analysis Terminal</i>
+""".strip()
         
-        return await self.send_message(message.strip())
+        return await self.send_message(message)
     
     async def test_connection(self) -> bool:
-        """
-        Test Telegram bot connection
-        """
-        if not self.bot:
+        """Test Telegram bot connection."""
+        if not self.base_url:
             return False
         
         try:
-            me = await self.bot.get_me()
-            logger.info(f"Telegram bot connected: @{me.username}")
-            return True
+            async with httpx.AsyncClient() as client:
+                response = await client.get(
+                    f"{self.base_url}/getMe",
+                    timeout=10.0
+                )
+                response.raise_for_status()
+                return True
         except Exception as e:
-            logger.error(f"Telegram connection test failed: {e}")
+            logger.error("Telegram connection test failed", error=str(e))
             return False
-
-
-# Factory function
-def create_telegram_service(bot_token: Optional[str] = None, chat_id: Optional[str] = None) -> TelegramService:
-    """Create Telegram service instance"""
-    return TelegramService(bot_token=bot_token, chat_id=chat_id)

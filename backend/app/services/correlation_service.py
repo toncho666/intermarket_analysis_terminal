@@ -1,242 +1,221 @@
-"""
-Correlation calculation service
-- Rolling Pearson/Spearman correlations
-- Fisher z confidence intervals
-- Delta vs previous period
-- Correlation matrix generation
-"""
-import numpy as np
 import pandas as pd
-from typing import List, Tuple, Optional
-from datetime import datetime
-import logging
+import numpy as np
+from scipy import stats
+from typing import List, Dict, Tuple, Optional
+import structlog
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger()
 
 
 class CorrelationService:
-    """Service for calculating cross-asset correlations"""
+    """Service for calculating cross-asset correlations."""
     
-    @staticmethod
-    def pearson_correlation(x: np.ndarray, y: np.ndarray) -> float:
-        """Calculate Pearson correlation coefficient"""
-        if len(x) != len(y) or len(x) < 3:
-            return 0.0
-        return float(np.corrcoef(x, y)[0, 1])
+    def __init__(self):
+        self.model_version = "v1.0"
     
-    @staticmethod
-    def spearman_correlation(x: np.ndarray, y: np.ndarray) -> float:
-        """Calculate Spearman rank correlation"""
-        from scipy.stats import spearmanr
-        if len(x) != len(y) or len(x) < 3:
-            return 0.0
-        corr, _ = spearmanr(x, y)
-        return float(corr)
-    
-    @staticmethod
-    def fisher_z_ci(r: float, n: int, confidence: float = 0.95) -> Tuple[float, float]:
-        """
-        Calculate Fisher z-transform confidence interval for correlation
-        """
-        if n < 4:
-            return (-1.0, 1.0)
-        
-        # Fisher z-transform
-        z = np.arctanh(r)
-        
-        # Standard error
-        se = 1.0 / np.sqrt(n - 3)
-        
-        # Z-score for confidence level
-        from scipy.stats import norm
-        z_score = norm.ppf((1 + confidence) / 2)
-        
-        # CI in z-space
-        z_low = z - z_score * se
-        z_high = z + z_score * se
-        
-        # Transform back to correlation space
-        r_low = np.tanh(z_low)
-        r_high = np.tanh(z_high)
-        
-        return (float(r_low), float(r_high))
-    
-    @staticmethod
-    def rolling_correlation(
-        prices_a: pd.Series,
-        prices_b: pd.Series,
+    def calculate_rolling_correlation(
+        self,
+        series_a: pd.Series,
+        series_b: pd.Series,
         window: int = 60,
         method: str = "pearson"
     ) -> pd.DataFrame:
         """
-        Calculate rolling correlation between two price series
+        Calculate rolling correlation between two series.
         
-        Returns DataFrame with columns: ts, correlation, ci_low, ci_high
+        Args:
+            series_a: First price/return series
+            series_b: Second price/return series
+            window: Rolling window size in days
+            method: 'pearson', 'spearman', or 'kendall'
+        
+        Returns:
+            DataFrame with columns: ts, correlation, ci_low, ci_high
         """
         # Calculate log returns
-        returns_a = np.log(prices_a / prices_a.shift(1)).dropna()
-        returns_b = np.log(prices_b / prices_b.shift(1)).dropna()
+        returns_a = np.log(series_a / series_a.shift(1)).dropna()
+        returns_b = np.log(series_b / series_b.shift(1)).dropna()
         
-        # Align indices
-        common_idx = returns_a.index.intersection(returns_b.index)
-        returns_a = returns_a.loc[common_idx]
-        returns_b = returns_b.loc[common_idx]
+        # Align series
+        aligned = pd.concat([returns_a, returns_b], axis=1).dropna()
+        aligned.columns = ['a', 'b']
+        
+        if len(aligned) < window:
+            logger.warning("Insufficient data for correlation calculation")
+            return pd.DataFrame()
         
         results = []
         
-        for i in range(window, len(returns_a)):
-            window_a = returns_a.iloc[i-window:i].values
-            window_b = returns_b.iloc[i-window:i].values
+        for i in range(window, len(aligned)):
+            window_data = aligned.iloc[i-window:i]
             
-            # Remove NaN
-            mask = ~(np.isnan(window_a) | np.isnan(window_b))
-            window_a = window_a[mask]
-            window_b = window_b[mask]
-            
-            if len(window_a) < 10:
-                continue
-            
-            # Calculate correlation
-            if method == "spearman":
-                corr = CorrelationService.spearman_correlation(window_a, window_b)
+            if method == "pearson":
+                corr, p_value = stats.pearsonr(window_data['a'], window_data['b'])
+            elif method == "spearman":
+                corr, p_value = stats.spearmanr(window_data['a'], window_data['b'])
+            elif method == "kendall":
+                corr, p_value = stats.kendalltau(window_data['a'], window_data['b'])
             else:
-                corr = CorrelationService.pearson_correlation(window_a, window_b)
+                raise ValueError(f"Unknown method: {method}")
             
-            # Calculate CI
-            ci_low, ci_high = CorrelationService.fisher_z_ci(corr, len(window_a))
+            # Fisher z-transform for confidence interval
+            z = np.arctanh(corr)
+            se = 1 / np.sqrt(window - 3)
+            z_low = z - 1.96 * se
+            z_high = z + 1.96 * se
+            ci_low = np.tanh(z_low)
+            ci_high = np.tanh(z_high)
             
             results.append({
-                'ts': returns_a.index[i],
-                'correlation': corr,
-                'ci_low': ci_low,
-                'ci_high': ci_high,
-                'n_obs': len(window_a)
+                'ts': aligned.index[i],
+                'correlation': round(corr, 4),
+                'p_value': round(p_value, 4),
+                'ci_low': round(ci_low, 4),
+                'ci_high': round(ci_high, 4),
             })
         
         return pd.DataFrame(results)
     
-    @staticmethod
-    def correlation_matrix(
+    def calculate_correlation_matrix(
+        self,
         returns_df: pd.DataFrame,
         window: int = 60,
         method: str = "pearson"
     ) -> pd.DataFrame:
         """
-        Calculate correlation matrix for multiple assets
+        Calculate correlation matrix for multiple assets.
         
         Args:
-            returns_df: DataFrame with asset returns (columns = assets)
-            window: rolling window size
-            method: pearson or spearman
+            returns_df: DataFrame with asset returns as columns
+            window: Rolling window size
+            method: Correlation method
         
         Returns:
-            Correlation matrix (DataFrame)
+            Correlation matrix as DataFrame
         """
-        # Use last `window` observations
-        recent_returns = returns_df.iloc[-window:]
-        
-        if method == "spearman":
-            corr_matrix = recent_returns.corr(method='spearman')
+        if method == "pearson":
+            return returns_df.rolling(window=window).corr()
+        elif method == "spearman":
+            return returns_df.rolling(window=window).corr(method='spearman')
         else:
-            corr_matrix = recent_returns.corr(method='pearson')
-        
-        return corr_matrix
+            raise ValueError(f"Matrix correlation not supported for {method}")
     
-    @staticmethod
-    def correlation_delta(
-        current_corr: float,
-        previous_corr: float
-    ) -> float:
-        """Calculate change in correlation"""
-        return current_corr - previous_corr
-    
-    @staticmethod
-    def exponential_weighted_correlation(
-        prices_a: pd.Series,
-        prices_b: pd.Series,
-        span: int = 60
-    ) -> pd.Series:
-        """
-        Calculate exponentially weighted moving correlation
-        """
-        returns_a = np.log(prices_a / prices_a.shift(1))
-        returns_b = np.log(prices_b / prices_b.shift(1))
-        
-        # EWMA correlation
-        ewm_corr = returns_a.ewm(span=span).corr(returns_b.ewm(span=span))
-        
-        return ewm_corr
-    
-    @staticmethod
-    def partial_correlation(
+    def calculate_partial_correlation(
+        self,
         returns_df: pd.DataFrame,
         asset_a: str,
         asset_b: str
     ) -> float:
         """
-        Calculate partial correlation between two assets controlling for all others
-        Uses inverse of correlation matrix
+        Calculate partial correlation between two assets controlling for all others.
+        
+        Uses precision matrix (inverse of covariance matrix).
         """
-        corr_matrix = returns_df.corr()
+        cov_matrix = returns_df.cov()
         
         try:
-            # Precision matrix (inverse of correlation matrix)
-            precision_matrix = np.linalg.inv(corr_matrix.values)
+            precision_matrix = np.linalg.inv(cov_matrix)
             
-            # Get indices
-            idx_a = list(corr_matrix.columns).index(asset_a)
-            idx_b = list(corr_matrix.columns).index(asset_b)
+            # Partial correlation = -precision[i,j] / sqrt(precision[i,i] * precision[j,j])
+            i = list(returns_df.columns).index(asset_a)
+            j = list(returns_df.columns).index(asset_b)
             
-            # Partial correlation
-            partial_corr = -precision_matrix[idx_a, idx_b] / np.sqrt(
-                precision_matrix[idx_a, idx_a] * precision_matrix[idx_b, idx_b]
+            partial_corr = -precision_matrix.iloc[i, j] / np.sqrt(
+                precision_matrix.iloc[i, i] * precision_matrix.iloc[j, j]
             )
             
-            return float(partial_corr)
+            return round(partial_corr, 4)
+            
         except np.linalg.LinAlgError:
-            logger.warning("Singular matrix in partial correlation calculation")
-            return 0.0
+            logger.warning("Singular covariance matrix, cannot compute partial correlation")
+            return np.nan
     
-    @staticmethod
-    def lead_lag_correlation(
-        prices_a: pd.Series,
-        prices_b: pd.Series,
-        max_lag: int = 5,
-        window: int = 60
-    ) -> pd.DataFrame:
+    def calculate_lead_lag_correlation(
+        self,
+        series_a: pd.Series,
+        series_b: pd.Series,
+        max_lag: int = 5
+    ) -> Dict[int, float]:
         """
-        Calculate cross-correlation with lags
-        Positive lag: B leads A
-        Negative lag: A leads B
-        """
-        returns_a = np.log(prices_a / prices_a.shift(1)).dropna()
-        returns_b = np.log(prices_b / prices_b.shift(1)).dropna()
+        Calculate cross-correlation at different lags.
         
-        results = []
+        Returns:
+            Dict mapping lag to correlation
+        """
+        returns_a = np.log(series_a / series_a.shift(1)).dropna()
+        returns_b = np.log(series_b / series_b.shift(1)).dropna()
+        
+        aligned = pd.concat([returns_a, returns_b], axis=1).dropna()
+        aligned.columns = ['a', 'b']
+        
+        results = {}
         
         for lag in range(-max_lag, max_lag + 1):
             if lag > 0:
-                # B leads A
-                shifted_b = returns_b.shift(lag)
-            elif lag < 0:
                 # A leads B
-                shifted_a = returns_a.shift(-lag)
-                shifted_b = returns_b
+                corr = aligned['a'].iloc[:-lag].corr(aligned['b'].iloc[lag:])
+            elif lag < 0:
+                # B leads A
+                corr = aligned['a'].iloc[-lag:].corr(aligned['b'].iloc[:lag])
             else:
-                shifted_a = returns_a
-                shifted_b = returns_b
+                corr = aligned['a'].corr(aligned['b'])
             
-            # Calculate correlation on rolling window
-            rolling_corr = shifted_a.rolling(window).corr(shifted_b)
-            
-            results.append({
-                'lag': lag,
-                'mean_correlation': rolling_corr.mean(),
-                'last_correlation': rolling_corr.iloc[-1] if len(rolling_corr) > 0 else 0
-            })
+            results[lag] = round(corr, 4)
         
-        return pd.DataFrame(results)
-
-
-# Singleton instance
-correlation_service = CorrelationService()
+        return results
+    
+    def calculate_correlation_delta(
+        self,
+        current_corr: float,
+        previous_corr: float
+    ) -> float:
+        """Calculate change in correlation."""
+        return round(current_corr - previous_corr, 4)
+    
+    def detect_correlation_anomaly(
+        self,
+        correlations: pd.Series,
+        window: int = 250,
+        threshold: float = 2.0
+    ) -> List[Dict]:
+        """
+        Detect anomalies in correlation series using z-score.
+        
+        Args:
+            correlations: Series of correlation values
+            window: Lookback window for mean/std calculation
+            threshold: Z-score threshold for anomaly detection
+        
+        Returns:
+            List of anomaly dictionaries
+        """
+        rolling_mean = correlations.rolling(window=window, min_periods=60).mean()
+        rolling_std = correlations.rolling(window=window, min_periods=60).std()
+        
+        z_scores = (correlations - rolling_mean) / rolling_std
+        
+        anomalies = []
+        
+        for i in range(len(z_scores)):
+            if pd.notna(z_scores.iloc[i]) and abs(z_scores.iloc[i]) > threshold:
+                anomalies.append({
+                    'index': i,
+                    'ts': correlations.index[i],
+                    'value': correlations.iloc[i],
+                    'z_score': round(z_scores.iloc[i], 2),
+                    'direction': 'positive' if z_scores.iloc[i] > 0 else 'negative',
+                    'severity': self._get_severity(abs(z_scores.iloc[i]))
+                })
+        
+        return anomalies
+    
+    def _get_severity(self, z_score: float) -> str:
+        """Determine severity based on z-score magnitude."""
+        if z_score > 4:
+            return 'critical'
+        elif z_score > 3:
+            return 'high'
+        elif z_score > 2.5:
+            return 'medium'
+        else:
+            return 'low'

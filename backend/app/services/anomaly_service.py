@@ -1,317 +1,218 @@
-"""
-Anomaly detection service
-- Z-score based correlation break detection
-- CUSUM test for structural breaks
-- Isolation Forest for multivariate outliers
-- Spread outlier detection
-- Volatility spike detection
-"""
-import numpy as np
 import pandas as pd
-from typing import List, Dict, Any, Optional
-from datetime import datetime
+import numpy as np
+from typing import List, Dict
+import structlog
 from sklearn.ensemble import IsolationForest
-import logging
 
-logger = logging.getLogger(__name__)
+from app.config import settings
+
+logger = structlog.get_logger()
 
 
 class AnomalyService:
-    """Service for detecting market anomalies"""
+    """Service for anomaly detection."""
     
-    @staticmethod
-    def correlation_break_zscore(
-        correlation_series: pd.Series,
-        lookback: int = 250,
-        threshold: float = 2.0
-    ) -> List[Dict[str, Any]]:
+    def __init__(self):
+        self.model_version = "v1.0"
+        self.z_threshold = settings.ANOMALY_Z_THRESHOLD
+    
+    def detect_correlation_anomaly(
+        self,
+        correlations: pd.Series,
+        window: int = 250,
+        threshold: float = None
+    ) -> List[Dict]:
         """
-        Detect correlation breaks using z-score
-        An anomaly is when current correlation deviates from historical mean by > threshold σ
+        Detect anomalies in correlation series using z-score.
         """
+        threshold = threshold or self.z_threshold
+        
+        rolling_mean = correlations.rolling(window=window, min_periods=60).mean()
+        rolling_std = correlations.rolling(window=window, min_periods=60).std()
+        
+        z_scores = (correlations - rolling_mean) / rolling_std
+        
         anomalies = []
         
-        rolling_mean = correlation_series.rolling(window=lookback, min_periods=60).mean()
-        rolling_std = correlation_series.rolling(window=lookback, min_periods=60).std()
-        
-        z_scores = (correlation_series - rolling_mean) / rolling_std
-        
         for i in range(len(z_scores)):
-            if pd.isna(z_scores.iloc[i]):
-                continue
-            
-            z = z_scores.iloc[i]
-            if abs(z) > threshold:
-                severity = AnomalyService._calculate_severity(abs(z))
+            if pd.notna(z_scores.iloc[i]) and abs(z_scores.iloc[i]) > threshold:
                 anomalies.append({
-                    'index': i,
-                    'ts': correlation_series.index[i],
-                    'z_score': float(z),
-                    'correlation': float(correlation_series.iloc[i]),
-                    'mean': float(rolling_mean.iloc[i]) if not pd.isna(rolling_mean.iloc[i]) else None,
-                    'std': float(rolling_std.iloc[i]) if not pd.isna(rolling_std.iloc[i]) else None,
-                    'severity': severity,
-                    'direction': 'positive' if z > 0 else 'negative',
+                    'ts': correlations.index[i],
+                    'value': round(correlations.iloc[i], 4),
+                    'z_score': round(z_scores.iloc[i], 2),
+                    'direction': 'positive' if z_scores.iloc[i] > 0 else 'negative',
+                    'severity': self._get_severity(abs(z_scores.iloc[i])),
+                    'type': 'corr_break'
                 })
         
         return anomalies
     
-    @staticmethod
-    def cusum_test(
-        series: pd.Series,
-        significance: float = 0.05
-    ) -> Dict[str, Any]:
+    def detect_volatility_anomaly(
+        self,
+        volatility: pd.Series,
+        window: int = 60,
+        threshold: float = 2.0
+    ) -> List[Dict]:
         """
-        CUSUM test for structural break detection
+        Detect volatility spikes.
+        """
+        rolling_mean = volatility.rolling(window=window).mean()
+        rolling_std = volatility.rolling(window=window).std()
         
-        Returns:
-            dict with break_detected, break_point, p_value
-        """
-        try:
-            n = len(series)
-            if n < 20:
-                return {'break_detected': False, 'break_point': None, 'p_value': 1.0}
-            
-            # Calculate CUSUM
-            mean = series.mean()
-            std = series.std()
-            
-            cusum = np.cumsum(series - mean) / (std * np.sqrt(n))
-            
-            # Critical values (approximate)
-            # For significance = 0.05, critical value ≈ 0.948
-            critical_value = 0.948 if significance == 0.05 else 1.143  # 0.01
-            
-            # Find first crossing
-            break_idx = None
-            for i in range(len(cusum)):
-                if abs(cusum[i]) > critical_value:
-                    break_idx = i
-                    break
-            
-            break_detected = break_idx is not None
-            
-            return {
-                'break_detected': break_detected,
-                'break_point': break_idx,
-                'break_date': series.index[break_idx] if break_idx is not None else None,
-                'max_cusum': float(np.max(np.abs(cusum))),
-                'critical_value': critical_value,
-                'cusum_series': cusum.tolist(),
-            }
-        except Exception as e:
-            logger.error(f"CUSUM test failed: {e}")
-            return {'break_detected': False, 'break_point': None, 'p_value': 1.0}
+        z_scores = (volatility - rolling_mean) / rolling_std
+        
+        anomalies = []
+        
+        for i in range(len(z_scores)):
+            if pd.notna(z_scores.iloc[i]) and z_scores.iloc[i] > threshold:
+                anomalies.append({
+                    'ts': volatility.index[i],
+                    'value': round(volatility.iloc[i], 4),
+                    'z_score': round(z_scores.iloc[i], 2),
+                    'direction': 'positive',
+                    'severity': self._get_severity(z_scores.iloc[i]),
+                    'type': 'vol_spike'
+                })
+        
+        return anomalies
     
-    @staticmethod
-    def isolation_forest_detection(
-        features_df: pd.DataFrame,
-        contamination: float = 0.01,
-        random_state: int = 42
-    ) -> pd.DataFrame:
-        """
-        Use Isolation Forest for multivariate anomaly detection
-        
-        Args:
-            features_df: DataFrame with features (returns, volatilities, etc.)
-            contamination: expected proportion of outliers
-            random_state: for reproducibility
-        
-        Returns:
-            DataFrame with anomaly_score and is_anomaly columns
-        """
-        try:
-            # Drop NaN rows
-            clean_df = features_df.dropna()
-            
-            # Fit Isolation Forest
-            iso_forest = IsolationForest(
-                contamination=contamination,
-                random_state=random_state,
-                n_estimators=100,
-            )
-            
-            # Predict: -1 for anomaly, 1 for normal
-            predictions = iso_forest.fit_predict(clean_df)
-            
-            # Anomaly scores (lower = more anomalous)
-            scores = iso_forest.decision_function(clean_df)
-            
-            results = pd.DataFrame(index=clean_df.index)
-            results['anomaly_score'] = scores
-            results['is_anomaly'] = predictions == -1
-            
-            return results
-        except Exception as e:
-            logger.error(f"Isolation Forest failed: {e}")
-            return pd.DataFrame({'anomaly_score': [], 'is_anomaly': []})
-    
-    @staticmethod
-    def spread_outlier_detection(
+    def detect_spread_anomaly(
+        self,
         spread: pd.Series,
         window: int = 60,
         threshold: float = 3.0
-    ) -> List[Dict[str, Any]]:
+    ) -> List[Dict]:
         """
-        Detect spread outliers using rolling z-score
+        Detect spread outliers (for cointegration pairs).
         """
-        anomalies = []
-        
-        rolling_mean = spread.rolling(window=window, min_periods=30).mean()
-        rolling_std = spread.rolling(window=window, min_periods=30).std()
+        rolling_mean = spread.rolling(window=window).mean()
+        rolling_std = spread.rolling(window=window).std()
         
         z_scores = (spread - rolling_mean) / rolling_std
         
+        anomalies = []
+        
         for i in range(len(z_scores)):
-            if pd.isna(z_scores.iloc[i]):
-                continue
-            
-            z = z_scores.iloc[i]
-            if abs(z) > threshold:
-                severity = AnomalyService._calculate_severity(abs(z))
+            if pd.notna(z_scores.iloc[i]) and abs(z_scores.iloc[i]) > threshold:
                 anomalies.append({
-                    'index': i,
                     'ts': spread.index[i],
-                    'z_score': float(z),
-                    'spread_value': float(spread.iloc[i]),
-                    'mean': float(rolling_mean.iloc[i]) if not pd.isna(rolling_mean.iloc[i]) else None,
-                    'std': float(rolling_std.iloc[i]) if not pd.isna(rolling_std.iloc[i]) else None,
-                    'severity': severity,
-                    'direction': 'positive' if z > 0 else 'negative',
+                    'value': round(spread.iloc[i], 4),
+                    'z_score': round(z_scores.iloc[i], 2),
+                    'direction': 'positive' if z_scores.iloc[i] > 0 else 'negative',
+                    'severity': self._get_severity(abs(z_scores.iloc[i])),
+                    'type': 'divergence'
                 })
         
         return anomalies
     
-    @staticmethod
-    def volatility_spike_detection(
-        prices: pd.Series,
-        window: int = 60,
-        threshold_multiplier: float = 2.0
-    ) -> List[Dict[str, Any]]:
+    def detect_multivariate_anomaly(
+        self,
+        returns_df: pd.DataFrame,
+        contamination: float = 0.01
+    ) -> List[Dict]:
         """
-        Detect volatility spikes (realized vol > threshold × historical average)
+        Detect multivariate anomalies using Isolation Forest.
         """
+        # Drop NaN rows
+        clean_data = returns_df.dropna()
+        
+        if len(clean_data) < 100:
+            return []
+        
+        # Fit Isolation Forest
+        model = IsolationForest(
+            contamination=contamination,
+            random_state=42,
+            n_estimators=100
+        )
+        
+        predictions = model.fit_predict(clean_data)
+        scores = model.score_samples(clean_data)
+        
         anomalies = []
         
-        # Calculate log returns
-        returns = np.log(prices / prices.shift(1)).dropna()
-        
-        # Realized volatility (rolling)
-        realized_vol = returns.rolling(window=20).std() * np.sqrt(252)
-        
-        # Historical average vol
-        historical_vol = realized_vol.rolling(window=window, min_periods=30).mean()
-        
-        # Ratio
-        vol_ratio = realized_vol / historical_vol
-        
-        for i in range(len(vol_ratio)):
-            if pd.isna(vol_ratio.iloc[i]):
-                continue
-            
-            ratio = vol_ratio.iloc[i]
-            if ratio > threshold_multiplier:
-                severity = AnomalyService._calculate_severity(ratio - 1)
+        for i, (pred, score) in enumerate(zip(predictions, scores)):
+            if pred == -1:  # Anomaly
                 anomalies.append({
-                    'index': i,
-                    'ts': realized_vol.index[i],
-                    'vol_ratio': float(ratio),
-                    'realized_vol': float(realized_vol.iloc[i]),
-                    'historical_vol': float(historical_vol.iloc[i]) if not pd.isna(historical_vol.iloc[i]) else None,
-                    'severity': severity,
+                    'ts': clean_data.index[i],
+                    'anomaly_score': round(-score, 4),  # Negative score = more anomalous
+                    'severity': self._get_severity(-score * 10),
+                    'type': 'multivariate',
+                    'values': {col: round(clean_data.iloc[i][col], 4) for col in clean_data.columns}
                 })
         
         return anomalies
     
-    @staticmethod
-    def divergence_detection(
-        prices_a: pd.Series,
-        prices_b: pd.Series,
-        correlation_series: pd.Series,
-        price_threshold: float = 0.05,
-        corr_threshold: float = -0.3
-    ) -> List[Dict[str, Any]]:
+    def detect_cusum_anomaly(
+        self,
+        series: pd.Series,
+        threshold: float = 1.0
+    ) -> List[Dict]:
         """
-        Detect divergences: prices moving apart while correlation was high
+        Detect structural breaks using CUSUM test.
         """
+        # Standardize series
+        mean = series.mean()
+        std = series.std()
+        standardized = (series - mean) / std
+        
+        # Calculate CUSUM
+        cusum = standardized.cumsum()
+        
+        # Detect when CUSUM exceeds threshold * std * sqrt(n)
+        n = len(series)
+        boundary = threshold * std * np.sqrt(np.arange(1, n + 1))
+        
         anomalies = []
         
-        # Calculate rolling returns
-        returns_a = prices_a.pct_change(20)
-        returns_b = prices_b.pct_change(20)
-        
-        # Correlation change
-        corr_change = correlation_series.diff(20)
-        
-        for i in range(20, len(prices_a)):
-            if pd.isna(returns_a.iloc[i]) or pd.isna(returns_b.iloc[i]):
-                continue
-            if pd.isna(corr_change.iloc[i]):
-                continue
-            
-            # Check for divergence: prices moving in opposite directions
-            # while correlation was decreasing
-            ret_a = returns_a.iloc[i]
-            ret_b = returns_b.iloc[i]
-            delta_corr = corr_change.iloc[i]
-            
-            if (ret_a > price_threshold and ret_b < -price_threshold and delta_corr < corr_threshold) or \
-               (ret_a < -price_threshold and ret_b > price_threshold and delta_corr < corr_threshold):
-                
+        for i in range(len(cusum)):
+            if abs(cusum.iloc[i]) > boundary[i]:
                 anomalies.append({
-                    'index': i,
-                    'ts': prices_a.index[i],
-                    'return_a': float(ret_a),
-                    'return_b': float(ret_b),
-                    'corr_change': float(delta_corr),
-                    'severity': 'high' if abs(delta_corr) > 0.5 else 'medium',
+                    'ts': series.index[i],
+                    'cusum_value': round(cusum.iloc[i], 4),
+                    'boundary': round(boundary[i], 4),
+                    'severity': 'high' if abs(cusum.iloc[i]) > 2 * boundary[i] else 'medium',
+                    'type': 'structural_break'
                 })
         
         return anomalies
     
-    @staticmethod
-    def _calculate_severity(z_score: float) -> str:
-        """Map z-score to severity level"""
-        if z_score >= 4.0:
+    def _get_severity(self, magnitude: float) -> str:
+        """Determine severity based on magnitude."""
+        if magnitude > 4:
             return 'critical'
-        elif z_score >= 3.0:
+        elif magnitude > 3:
             return 'high'
-        elif z_score >= 2.0:
+        elif magnitude > 2.5:
             return 'medium'
         else:
             return 'low'
     
-    @staticmethod
-    def detect_all_anomalies(
-        prices_a: pd.Series,
-        prices_b: pd.Series,
-        correlation_series: pd.Series,
-        hedge_ratio: Optional[float] = None
-    ) -> Dict[str, List[Dict[str, Any]]]:
+    def ensemble_anomaly_detection(
+        self,
+        correlations: pd.Series,
+        volatility: pd.Series,
+        spread: pd.Series = None
+    ) -> List[Dict]:
         """
-        Run all anomaly detection methods and return combined results
+        Combine multiple anomaly detection methods.
         """
-        results = {
-            'correlation_breaks': AnomalyService.correlation_break_zscore(correlation_series),
-            'cusum_breaks': [],
-            'spread_outliers': [],
-            'volatility_spikes_a': AnomalyService.volatility_spike_detection(prices_a),
-            'volatility_spikes_b': AnomalyService.volatility_spike_detection(prices_b),
-            'divergences': AnomalyService.divergence_detection(prices_a, prices_b, correlation_series),
-        }
+        all_anomalies = []
         
-        # CUSUM on correlation
-        cusum_result = AnomalyService.cusum_test(correlation_series)
-        if cusum_result['break_detected']:
-            results['cusum_breaks'] = [cusum_result]
+        # Correlation anomalies
+        corr_anomalies = self.detect_correlation_anomaly(correlations)
+        all_anomalies.extend(corr_anomalies)
         
-        # Spread outliers if hedge ratio available
-        if hedge_ratio is not None:
-            spread = prices_a - hedge_ratio * prices_b
-            results['spread_outliers'] = AnomalyService.spread_outlier_detection(spread)
+        # Volatility anomalies
+        vol_anomalies = self.detect_volatility_anomaly(volatility)
+        all_anomalies.extend(vol_anomalies)
         
-        return results
-
-
-# Singleton instance
-anomaly_service = AnomalyService()
+        # Spread anomalies
+        if spread is not None:
+            spread_anomalies = self.detect_spread_anomaly(spread)
+            all_anomalies.extend(spread_anomalies)
+        
+        # Sort by timestamp
+        all_anomalies.sort(key=lambda x: x['ts'])
+        
+        return all_anomalies

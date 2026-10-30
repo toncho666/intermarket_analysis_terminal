@@ -1,277 +1,263 @@
-"""
-Cointegration analysis service
-- Engle-Granger 2-step method
-- Johansen test (MLE)
-- Half-life calculation (OU process)
-- Spread z-score
-- Hurst exponent
-"""
-import numpy as np
 import pandas as pd
-from typing import Tuple, Optional, Dict, Any
-from datetime import datetime
-import logging
+import numpy as np
 from statsmodels.tsa.stattools import adfuller, coint
 from statsmodels.tsa.vector_ar.vecm import coint_johansen
 from statsmodels.regression.linear_model import OLS
-from statsmodels.tools import add_constant
+from statsmodels.tsa.ar_model import AutoReg
+from typing import Dict, Optional, Tuple
+import structlog
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger()
 
 
 class CointegrationService:
-    """Service for cointegration analysis"""
+    """Service for cointegration analysis."""
     
-    @staticmethod
+    def __init__(self):
+        self.model_version = "v1.0"
+    
     def engle_granger_test(
-        prices_a: pd.Series,
-        prices_b: pd.Series,
-        significance: float = 0.05
-    ) -> Dict[str, Any]:
+        self,
+        series_a: pd.Series,
+        series_b: pd.Series
+    ) -> Dict:
         """
-        Engle-Granger 2-step cointegration test
+        Perform Engle-Granger 2-step cointegration test.
         
-        Step 1: OLS regression to find hedge ratio
+        Step 1: Regress Y on X to get residuals
         Step 2: ADF test on residuals
         
         Returns:
-            dict with p_value, test_statistic, is_cointegrated, hedge_ratio, spread
+            Dictionary with test results
         """
-        # Ensure same length
-        min_len = min(len(prices_a), len(prices_b))
-        y = prices_a.iloc[-min_len:].values
-        x = prices_b.iloc[-min_len:].values
-        
-        # Step 1: OLS regression y = alpha + beta * x + epsilon
-        x_const = add_constant(x)
-        model = OLS(y, x_const).fit()
-        hedge_ratio = model.params[1]
-        residuals = model.resid
-        
-        # Step 2: ADF test on residuals
         try:
-            adf_result = adfuller(residuals, maxlag=1, autolag=None)
-            test_stat = adf_result[0]
-            p_value = adf_result[1]
-        except Exception as e:
-            logger.error(f"ADF test failed: {e}")
+            # Ensure same length
+            aligned = pd.concat([series_a, series_b], axis=1).dropna()
+            aligned.columns = ['y', 'x']
+            
+            # Step 1: OLS regression
+            model = OLS(aligned['y'], aligned['x']).fit()
+            residuals = model.resid
+            
+            # Step 2: ADF test on residuals
+            adf_result = adfuller(residuals, maxlag=1)
+            
+            # Calculate hedge ratio
+            hedge_ratio = model.params.iloc[0]
+            
             return {
-                'p_value': 1.0,
-                'test_statistic': 0.0,
-                'is_cointegrated': False,
-                'hedge_ratio': hedge_ratio,
-                'spread': None,
-                'half_life': None,
+                'is_cointegrated': adf_result[1] < 0.05,
+                'p_value': round(adf_result[1], 4),
+                'adf_statistic': round(adf_result[0], 4),
+                'critical_values': {k: round(v, 4) for k, v in adf_result[4].items()},
+                'hedge_ratio': round(hedge_ratio, 4),
+                'residuals_mean': round(residuals.mean(), 4),
+                'residuals_std': round(residuals.std(), 4),
             }
-        
-        # Calculate spread
-        spread = y - hedge_ratio * x
-        
-        # Calculate half-life
-        half_life = CointegrationService.calculate_half_life(spread)
-        
-        return {
-            'p_value': float(p_value),
-            'test_statistic': float(test_stat),
-            'is_cointegrated': p_value < significance,
-            'hedge_ratio': float(hedge_ratio),
-            'spread': spread.tolist(),
-            'half_life': half_life,
-        }
+            
+        except Exception as e:
+            logger.error("Engle-Granger test failed", error=str(e))
+            return {'error': str(e)}
     
-    @staticmethod
     def johansen_test(
-        prices_df: pd.DataFrame,
+        self,
+        series_a: pd.Series,
+        series_b: pd.Series,
         det_order: int = 0,
         k_ar_diff: int = 1
-    ) -> Dict[str, Any]:
+    ) -> Dict:
         """
-        Johansen cointegration test (MLE-based)
-        Tests for multiple cointegrating relationships
+        Perform Johansen cointegration test (MLE-based).
         
         Args:
-            prices_df: DataFrame with price columns (min 2)
-            det_order: -1 (no deterministic), 0 (constant), 1 (linear trend)
-            k_ar_diff: number of lags in VAR
+            series_a: First price series
+            series_b: Second price series
+            det_order: Deterministic trend order (-1, 0, 1)
+            k_ar_diff: Number of lags in VAR
         
         Returns:
-            dict with trace_stats, max_eigen_stats, coint_vectors
+            Dictionary with test results
         """
         try:
-            # Johansen test requires at least 2 columns
-            result = coint_johansen(prices_df.values, det_order=det_order, k_ar_diff=k_ar_diff)
+            aligned = pd.concat([series_a, series_b], axis=1).dropna()
+            aligned.columns = ['y', 'x']
+            
+            # Johansen test
+            result = coint_johansen(aligned, det_order, k_ar_diff)
             
             # Trace statistics
-            trace_stats = result.lr1  # Trace statistic
-            trace_cv = result.cvt     # Critical values (90%, 95%, 99%)
+            trace_stats = result.lr1
+            trace_crit = result.cvt[:, 1]  # 95% critical values
             
             # Maximum eigenvalue statistics
             max_eigen_stats = result.lr2
-            max_eigen_cv = result.cvm
-            
-            # Cointegrating vectors
-            coint_vectors = result.eig  # Eigenvectors
-            
-            # Determine number of cointegrating relationships
-            n_coint = 0
-            for i in range(len(trace_stats)):
-                if trace_stats[i] > trace_cv[i, 1]:  # 95% critical value
-                    n_coint += 1
-                else:
-                    break
+            max_eigen_crit = result.cvt[:, 2]  # 95% critical values
             
             return {
-                'trace_stats': trace_stats.tolist(),
-                'trace_critical_values': trace_cv.tolist(),
-                'max_eigen_stats': max_eigen_stats.tolist(),
-                'max_eigen_critical_values': max_eigen_cv.tolist(),
-                'coint_vectors': coint_vectors.tolist(),
-                'n_cointegrating_relations': n_coint,
-                'is_cointegrated': n_coint > 0,
+                'trace_stats': [round(s, 4) for s in trace_stats],
+                'trace_crit_95': [round(c, 4) for c in trace_crit],
+                'max_eigen_stats': [round(s, 4) for s in max_eigen_stats],
+                'max_eigen_crit_95': [round(c, 4) for c in max_eigen_crit],
+                'is_cointegrated_trace': trace_stats[0] > trace_crit[0],
+                'is_cointegrated_max_eigen': max_eigen_stats[0] > max_eigen_crit[0],
+                'eigenvectors': result.evec.tolist(),
             }
+            
         except Exception as e:
-            logger.error(f"Johansen test failed: {e}")
-            return {
-                'trace_stats': [],
-                'trace_critical_values': [],
-                'max_eigen_stats': [],
-                'max_eigen_critical_values': [],
-                'coint_vectors': [],
-                'n_cointegrating_relations': 0,
-                'is_cointegrated': False,
-            }
+            logger.error("Johansen test failed", error=str(e))
+            return {'error': str(e)}
     
-    @staticmethod
-    def calculate_half_life(spread: np.ndarray) -> Optional[float]:
+    def calculate_half_life(
+        self,
+        spread: pd.Series
+    ) -> Optional[float]:
         """
-        Calculate half-life of mean reversion using Ornstein-Uhlenbeck process
+        Calculate half-life of mean reversion using Ornstein-Uhlenbeck process.
         
-        Model: dS = theta * (mu - S) * dt + sigma * dW
         Half-life = -log(2) / log(phi)
-        where phi is estimated from AR(1): S_t = alpha + phi * S_{t-1} + epsilon
+        where phi is the AR(1) coefficient of the spread.
+        
+        Returns:
+            Half-life in days, or None if not mean-reverting
         """
         try:
-            spread = np.array(spread)
-            if len(spread) < 10:
-                return None
+            # Fit AR(1) model
+            spread_lag = spread.shift(1).dropna()
+            spread_diff = spread.diff().dropna()
             
-            # Lag spread
-            spread_lag = spread[:-1]
-            spread_diff = np.diff(spread)
+            # Align
+            aligned = pd.concat([spread_diff, spread_lag], axis=1).dropna()
+            aligned.columns = ['diff', 'lag']
             
-            # OLS: delta_S = alpha + phi * S_{t-1}
-            x = add_constant(spread_lag)
-            model = OLS(spread_diff, x).fit()
-            phi = 1 + model.params[1]  # Convert to level
+            # OLS: Δy_t = φ * y_{t-1} + ε_t
+            model = OLS(aligned['diff'], aligned['lag']).fit()
+            phi = 1 + model.params.iloc[0]
             
             if phi >= 1 or phi <= 0:
                 return None  # Not mean-reverting
             
             half_life = -np.log(2) / np.log(phi)
-            return float(max(0, half_life))
+            
+            return round(half_life, 2)
+            
         except Exception as e:
-            logger.error(f"Half-life calculation failed: {e}")
+            logger.error("Half-life calculation failed", error=str(e))
             return None
     
-    @staticmethod
-    def spread_z_score(
-        prices_a: pd.Series,
-        prices_b: pd.Series,
+    def calculate_spread_zscore(
+        self,
+        series_a: pd.Series,
+        series_b: pd.Series,
         hedge_ratio: float,
         window: int = 60
     ) -> pd.Series:
         """
-        Calculate rolling z-score of the spread
-        """
-        spread = prices_a - hedge_ratio * prices_b
+        Calculate z-score of the cointegration spread.
         
-        # Rolling mean and std
+        Spread = Y - hedge_ratio * X
+        Z-score = (Spread - rolling_mean) / rolling_std
+        """
+        spread = series_a - hedge_ratio * series_b
+        
         rolling_mean = spread.rolling(window=window).mean()
         rolling_std = spread.rolling(window=window).std()
         
-        # Z-score
         z_score = (spread - rolling_mean) / rolling_std
         
         return z_score
     
-    @staticmethod
-    def hurst_exponent(time_series: np.ndarray, max_lag: int = 20) -> float:
+    def rolling_cointegration_test(
+        self,
+        series_a: pd.Series,
+        series_b: pd.Series,
+        window: int = 250,
+        step: int = 5
+    ) -> pd.DataFrame:
         """
-        Calculate Hurst exponent using R/S analysis
+        Perform rolling Engle-Granger test.
+        
+        Returns:
+            DataFrame with columns: ts, p_value, hedge_ratio, is_cointegrated
+        """
+        results = []
+        
+        for i in range(window, len(series_a), step):
+            window_a = series_a.iloc[i-window:i]
+            window_b = series_b.iloc[i-window:i]
+            
+            test_result = self.engle_granger_test(window_a, window_b)
+            
+            if 'error' not in test_result:
+                results.append({
+                    'ts': series_a.index[i],
+                    'p_value': test_result['p_value'],
+                    'hedge_ratio': test_result['hedge_ratio'],
+                    'is_cointegrated': test_result['is_cointegrated'],
+                })
+        
+        return pd.DataFrame(results)
+    
+    def detect_cointegration_break(
+        self,
+        rolling_results: pd.DataFrame,
+        threshold: float = 0.05
+    ) -> list:
+        """
+        Detect breaks in cointegration relationship.
+        
+        A break is detected when p-value crosses the threshold.
+        """
+        breaks = []
+        
+        was_cointegrated = None
+        
+        for i, row in rolling_results.iterrows():
+            is_coint = row['is_cointegrated']
+            
+            if was_cointegrated is not None and was_cointegrated != is_coint:
+                breaks.append({
+                    'ts': row['ts'],
+                    'type': 'coint_break' if was_cointegrated else 'coint_formed',
+                    'p_value': row['p_value'],
+                    'hedge_ratio': row['hedge_ratio'],
+                })
+            
+            was_cointegrated = is_coint
+        
+        return breaks
+    
+    def hurst_exponent(self, series: pd.Series, max_lag: int = 100) -> float:
+        """
+        Calculate Hurst exponent using R/S analysis.
         
         H > 0.5: Trending (persistent)
         H = 0.5: Random walk
         H < 0.5: Mean-reverting (anti-persistent)
         """
-        try:
-            time_series = np.array(time_series)
-            lags = range(2, min(max_lag, len(time_series) // 2))
+        lags = range(2, min(max_lag, len(series) // 2))
+        
+        tau = []
+        for lag in lags:
+            # Calculate R/S statistic
+            returns = series.diff().dropna()
+            rolling_mean = returns.rolling(window=lag).mean()
+            rolling_std = returns.rolling(window=lag).std()
             
-            # Calculate R/S for each lag
-            rs_values = []
-            for lag in lags:
-                # Split into chunks
-                n_chunks = len(time_series) // lag
-                if n_chunks < 1:
-                    continue
-                
-                rs_chunk_list = []
-                for i in range(n_chunks):
-                    chunk = time_series[i*lag:(i+1)*lag]
-                    mean_chunk = np.mean(chunk)
-                    deviation = np.cumsum(chunk - mean_chunk)
-                    r = np.max(deviation) - np.min(deviation)
-                    s = np.std(chunk)
-                    if s > 0:
-                        rs_chunk_list.append(r / s)
-                
-                if rs_chunk_list:
-                    rs_values.append((np.log(lag), np.log(np.mean(rs_chunk_list))))
+            cumulative_deviation = (returns - rolling_mean).cumsum()
+            r = cumulative_deviation.max() - cumulative_deviation.min()
+            s = rolling_std
             
-            if len(rs_values) < 2:
-                return 0.5
-            
-            # Linear regression: log(R/S) = H * log(lag) + c
-            x = np.array([v[0] for v in rs_values])
-            y = np.array([v[1] for v in rs_values])
-            
-            model = OLS(y, add_constant(x)).fit()
-            hurst = model.params[1]
-            
-            return float(np.clip(hurst, 0, 1))
-        except Exception as e:
-            logger.error(f"Hurst exponent calculation failed: {e}")
+            if s.mean() > 0:
+                tau.append((lag, r.mean() / s.mean()))
+        
+        if len(tau) < 2:
             return 0.5
-    
-    @staticmethod
-    def rolling_cointegration(
-        prices_a: pd.Series,
-        prices_b: pd.Series,
-        window: int = 250,
-        step: int = 5
-    ) -> pd.DataFrame:
-        """
-        Calculate rolling cointegration test results
-        """
-        results = []
         
-        for i in range(window, len(prices_a), step):
-            window_a = prices_a.iloc[i-window:i]
-            window_b = prices_b.iloc[i-window:i]
-            
-            eg_result = CointegrationService.engle_granger_test(window_a, window_b)
-            
-            results.append({
-                'ts': prices_a.index[i-1],
-                'p_value': eg_result['p_value'],
-                'test_statistic': eg_result['test_statistic'],
-                'is_cointegrated': eg_result['is_cointegrated'],
-                'hedge_ratio': eg_result['hedge_ratio'],
-                'half_life': eg_result['half_life'],
-            })
+        # Log-log regression
+        lags_log = np.log([t[0] for t in tau])
+        rs_log = np.log([t[1] for t in tau])
         
-        return pd.DataFrame(results)
-
-
-# Singleton instance
-cointegration_service = CointegrationService()
+        model = OLS(rs_log, lags_log).fit()
+        hurst = model.params.iloc[0]
+        
+        return round(hurst, 4)

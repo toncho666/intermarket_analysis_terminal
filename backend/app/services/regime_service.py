@@ -1,270 +1,205 @@
-"""
-Market regime detection service
-- Composite score calculation
-- PCA-based regime detection
-- Risk-On/Risk-Off classification
-- Component signals
-"""
-import numpy as np
 import pandas as pd
-from typing import Dict, Any, List, Optional
-from datetime import datetime
-import logging
+import numpy as np
+from typing import Dict, List
+import structlog
 
-logger = logging.getLogger(__name__)
+logger = structlog.get_logger()
 
 
 class RegimeService:
-    """Service for market regime detection"""
+    """Service for market regime detection."""
     
-    @staticmethod
+    def __init__(self):
+        self.model_version = "v1.0"
+    
     def calculate_regime_score(
-        equity_bond_corr: float,
-        vix_level: float,
-        vix3m_level: float,
-        hy_oas: float,
-        ig_oas: float,
-        dxy_momentum: float,
-        commodity_momentum: float = 0.0,
-    ) -> Dict[str, Any]:
+        self,
+        data: Dict[str, pd.Series]
+    ) -> Dict:
         """
-        Calculate composite regime score (0-100)
+        Calculate composite regime score (0-100).
         
         Components:
         - Equity-Bond correlation (negative = risk-on)
         - VIX term structure (contango = risk-on)
         - Credit spreads (tight = risk-on)
-        - DXY momentum (weak USD = risk-on)
-        - Commodity momentum
+        - DXY momentum (weak = risk-on)
+        - Risk appetite index
         
         Returns:
-            dict with score, regime, components
+            Dictionary with score and components
         """
         components = []
         
-        # 1. Equity-Bond correlation (weight: 25%)
-        # Negative correlation = risk-on (flight to quality works)
-        # Score: -1 corr → 100, +1 corr → 0
-        eb_score = max(0, min(100, (1 - equity_bond_corr) * 50))
-        eb_signal = "Risk-On" if eb_score > 60 else "Risk-Off" if eb_score < 40 else "Neutral"
-        components.append({
-            'name': 'Equity-Bond Corr',
-            'value': round(equity_bond_corr, 3),
-            'score': round(eb_score, 1),
-            'weight': 0.25,
-            'signal': eb_signal,
-        })
+        # 1. Equity-Bond correlation (SPX vs US10Y)
+        if 'spx' in data and 'us10y' in data:
+            corr = data['spx'].tail(60).corr(data['us10y'].tail(60))
+            # Negative correlation is risk-on (flight to quality)
+            score = self._normalize_score(-corr, -1, 1)
+            components.append({
+                'name': 'Equity-Bond Corr',
+                'value': round(corr, 3),
+                'score': round(score, 1),
+                'signal': 'Risk-On' if score > 60 else ('Risk-Off' if score < 40 else 'Neutral')
+            })
         
-        # 2. VIX term structure (weight: 20%)
-        # VIX < VIX3M (contango) = risk-on
-        vix_ratio = vix_level / vix3m_level if vix3m_level > 0 else 1.0
-        vix_score = max(0, min(100, (1.2 - vix_ratio) * 200))
-        vix_signal = "Risk-On" if vix_score > 60 else "Risk-Off" if vix_score < 40 else "Neutral"
-        components.append({
-            'name': 'VIX Term Structure',
-            'value': round(vix_ratio, 3),
-            'score': round(vix_score, 1),
-            'weight': 0.20,
-            'signal': vix_signal,
-        })
+        # 2. VIX term structure (VIX3M / VIX ratio)
+        if 'vix' in data and 'vix3m' in data:
+            vix = data['vix'].iloc[-1]
+            vix3m = data['vix3m'].iloc[-1]
+            ratio = vix3m / vix if vix > 0 else 1
+            # Contango (ratio > 1) is risk-on
+            score = self._normalize_score(ratio, 0.8, 1.3)
+            components.append({
+                'name': 'VIX Term Structure',
+                'value': round(ratio, 3),
+                'score': round(score, 1),
+                'signal': 'Risk-On' if score > 60 else ('Risk-Off' if score < 40 else 'Neutral')
+            })
         
-        # 3. Credit spreads (weight: 25%)
-        # Tight spreads = risk-on
-        # HY OAS: < 300 = risk-on, > 500 = risk-off
-        hy_score = max(0, min(100, (600 - hy_oas) / 3))
-        hy_signal = "Risk-On" if hy_score > 60 else "Risk-Off" if hy_score < 40 else "Neutral"
-        components.append({
-            'name': 'Credit Spreads (HY)',
-            'value': round(hy_oas, 1),
-            'score': round(hy_score, 1),
-            'weight': 0.25,
-            'signal': hy_signal,
-        })
+        # 3. Credit spreads (HY OAS level)
+        if 'hy_oas' in data:
+            hy_oas = data['hy_oas'].iloc[-1]
+            # Lower spreads = risk-on
+            score = self._normalize_score(-hy_oas, -800, -200)
+            components.append({
+                'name': 'Credit Spreads',
+                'value': round(hy_oas, 1),
+                'score': round(score, 1),
+                'signal': 'Risk-On' if score > 60 else ('Risk-Off' if score < 40 else 'Neutral')
+            })
         
-        # 4. DXY momentum (weight: 15%)
-        # Weak/declining USD = risk-on
-        dxy_score = max(0, min(100, (0.05 - dxy_momentum) * 1000))
-        dxy_signal = "Risk-On" if dxy_score > 60 else "Risk-Off" if dxy_score < 40 else "Neutral"
-        components.append({
-            'name': 'DXY Momentum',
-            'value': round(dxy_momentum, 4),
-            'score': round(dxy_score, 1),
-            'weight': 0.15,
-            'signal': dxy_signal,
-        })
+        # 4. DXY momentum (20-day ROC)
+        if 'dxy' in data:
+            dxy = data['dxy']
+            roc_20d = (dxy.iloc[-1] / dxy.iloc[-20] - 1) * 100 if len(dxy) >= 20 else 0
+            # Weak dollar = risk-on
+            score = self._normalize_score(-roc_20d, -5, 5)
+            components.append({
+                'name': 'DXY Momentum',
+                'value': round(roc_20d, 2),
+                'score': round(score, 1),
+                'signal': 'Risk-On' if score > 60 else ('Risk-Off' if score < 40 else 'Neutral')
+            })
         
-        # 5. HY-IG spread (weight: 15%)
-        # Tight HY-IG spread = risk-on
-        hy_ig_spread = hy_oas - ig_oas
-        hig_score = max(0, min(100, (350 - hy_ig_spread) / 2))
-        hig_signal = "Risk-On" if hig_score > 60 else "Risk-Off" if hig_score < 40 else "Neutral"
-        components.append({
-            'name': 'HY-IG Spread',
-            'value': round(hy_ig_spread, 1),
-            'score': round(hig_score, 1),
-            'weight': 0.15,
-            'signal': hig_signal,
-        })
+        # 5. Risk appetite index (SPX+EEM+HY vs TLT+Gold+JPY)
+        if all(k in data for k in ['spx', 'eem', 'tlt', 'gold']):
+            risk_assets = data['spx'].tail(20).pct_change().sum() + \
+                         data['eem'].tail(20).pct_change().sum()
+            safe_assets = data['tlt'].tail(20).pct_change().sum() + \
+                         data['gold'].tail(20).pct_change().sum()
+            
+            risk_appetite = risk_assets - safe_assets
+            score = self._normalize_score(risk_appetite, -0.1, 0.1)
+            components.append({
+                'name': 'Risk Appetite',
+                'value': round(risk_appetite, 4),
+                'score': round(score, 1),
+                'signal': 'Risk-On' if score > 60 else ('Risk-Off' if score < 40 else 'Neutral')
+            })
         
-        # Composite score
-        total_score = sum(c['score'] * c['weight'] for c in components)
-        
-        # Determine regime
-        if total_score >= 65:
-            regime = "Risk-On"
-        elif total_score >= 40:
-            regime = "Neutral"
+        # Calculate composite score (weighted average)
+        if components:
+            weights = [0.25, 0.20, 0.25, 0.15, 0.15]  # Sum = 1.0
+            composite = sum(c['score'] * w for c, w in zip(components, weights[:len(components)]))
+            composite = min(100, max(0, composite))
         else:
-            regime = "Risk-Off"
+            composite = 50
         
         return {
-            'score': round(total_score, 1),
-            'regime': regime,
+            'score': round(composite, 1),
+            'regime': self._get_regime_label(composite),
             'components': components,
-            'as_of': datetime.utcnow().isoformat(),
+            'timestamp': pd.Timestamp.now().isoformat(),
+            'model_version': self.model_version
         }
     
-    @staticmethod
-    def pca_regime(
-        returns_df: pd.DataFrame,
-        n_components: int = 3
-    ) -> Dict[str, Any]:
-        """
-        PCA-based regime detection
-        First PC = market factor
-        Variance explained indicates regime clarity
-        """
-        from sklearn.decomposition import PCA
-        
-        try:
-            # Drop NaN
-            clean_returns = returns_df.dropna(axis=1)
-            
-            if clean_returns.shape[1] < 3:
-                return {'error': 'Need at least 3 assets for PCA'}
-            
-            pca = PCA(n_components=n_components)
-            pca.fit(clean_returns.values)
-            
-            # Variance explained
-            var_explained = pca.explained_variance_ratio_
-            
-            # First PC scores (market factor)
-            pc1_scores = pca.transform(clean_returns.values)[:, 0]
-            
-            # Current regime based on PC1
-            pc1_mean = np.mean(pc1_scores)
-            pc1_std = np.std(pc1_scores)
-            current_pc1 = pc1_scores[-1]
-            
-            # Z-score of current PC1
-            pc1_z = (current_pc1 - pc1_mean) / pc1_std if pc1_std > 0 else 0
-            
-            if pc1_z > 1:
-                regime = "Risk-On"
-            elif pc1_z < -1:
-                regime = "Risk-Off"
-            else:
-                regime = "Neutral"
-            
-            return {
-                'variance_explained': [round(v, 4) for v in var_explained],
-                'pc1_current': round(float(current_pc1), 4),
-                'pc1_z_score': round(float(pc1_z), 2),
-                'regime': regime,
-                'loadings': {
-                    clean_returns.columns[i]: round(float(pca.components_[0, i]), 4)
-                    for i in range(min(10, len(clean_returns.columns)))
-                },
-            }
-        except Exception as e:
-            logger.error(f"PCA regime detection failed: {e}")
-            return {'error': str(e)}
+    def _normalize_score(self, value: float, min_val: float, max_val: float) -> float:
+        """Normalize value to 0-100 scale."""
+        normalized = (value - min_val) / (max_val - min_val)
+        return min(100, max(0, normalized * 100))
     
-    @staticmethod
-    def risk_appetite_index(
-        spx_return: float,
-        eem_return: float,
-        hy_return: float,
-        tlt_return: float,
-        gold_return: float,
-        jpy_return: float,
-    ) -> Dict[str, Any]:
-        """
-        Calculate risk appetite index
-        
-        Risk assets: SPX, EEM, HY
-        Safe havens: TLT, Gold, JPY
-        
-        Index = (avg risk asset return) - (avg safe haven return)
-        """
-        risk_assets = [spx_return, eem_return, hy_return]
-        safe_havens = [tlt_return, gold_return, jpy_return]
-        
-        avg_risk = np.mean(risk_assets)
-        avg_safe = np.mean(safe_havens)
-        
-        index_value = avg_risk - avg_safe
-        
-        # Normalize to 0-100 scale
-        # Typical range: -0.05 to +0.05
-        normalized = max(0, min(100, (index_value + 0.05) * 1000))
-        
-        if normalized >= 60:
-            signal = "Risk-On"
-        elif normalized >= 40:
-            signal = "Neutral"
+    def _get_regime_label(self, score: float) -> str:
+        """Get regime label based on score."""
+        if score >= 70:
+            return 'Risk-On'
+        elif score >= 40:
+            return 'Neutral'
         else:
-            signal = "Risk-Off"
-        
-        return {
-            'index': round(normalized, 1),
-            'signal': signal,
-            'risk_avg_return': round(float(avg_risk), 6),
-            'safe_avg_return': round(float(avg_safe), 6),
-            'components': {
-                'SPX': round(spx_return, 6),
-                'EEM': round(eem_return, 6),
-                'HY': round(hy_return, 6),
-                'TLT': round(tlt_return, 6),
-                'Gold': round(gold_return, 6),
-                'JPY': round(jpy_return, 6),
-            }
-        }
+            return 'Risk-Off'
     
-    @staticmethod
-    def credit_impulse(
-        hy_oas_series: pd.Series,
-        ig_oas_series: pd.Series,
-        window: int = 20
-    ) -> Dict[str, Any]:
+    def detect_regime_change(
+        self,
+        scores: pd.Series,
+        window: int = 10,
+        threshold: float = 15
+    ) -> List[Dict]:
         """
-        Calculate credit impulse
-        Rate of change in credit spreads
+        Detect regime changes based on score movement.
+        
+        Args:
+            scores: Series of regime scores
+            window: Smoothing window
+            threshold: Minimum score change to trigger
+        
+        Returns:
+            List of regime change events
         """
-        hy_change = hy_oas_series.diff(window)
-        ig_change = ig_oas_series.diff(window)
+        smoothed = scores.rolling(window=window, min_periods=1).mean()
         
-        # Credit impulse: negative change = easing = risk-on
-        current_hy_change = float(hy_change.iloc[-1]) if len(hy_change) > 0 else 0
-        current_ig_change = float(ig_change.iloc[-1]) if len(ig_change) > 0 else 0
+        changes = []
+        prev_regime = None
         
-        impulse = -(current_hy_change + current_ig_change) / 2
+        for i in range(len(smoothed)):
+            current_regime = self._get_regime_label(smoothed.iloc[i])
+            
+            if prev_regime is not None and current_regime != prev_regime:
+                changes.append({
+                    'ts': scores.index[i],
+                    'from_regime': prev_regime,
+                    'to_regime': current_regime,
+                    'score': round(smoothed.iloc[i], 1)
+                })
+            
+            prev_regime = current_regime
         
-        if impulse > 10:
-            signal = "Easing (Risk-On)"
-        elif impulse > -10:
-            signal = "Neutral"
+        return changes
+    
+    def calculate_volatility_regime(
+        self,
+        vix: pd.Series,
+        window: int = 250
+    ) -> str:
+        """
+        Classify volatility regime based on VIX level and percentile.
+        """
+        current_vix = vix.iloc[-1]
+        percentile = (vix < current_vix).mean() * 100
+        
+        if current_vix < 15:
+            return 'Low Vol'
+        elif current_vix < 20:
+            return 'Normal Vol'
+        elif current_vix < 30:
+            return 'Elevated Vol'
         else:
-            signal = "Tightening (Risk-Off)"
+            return 'High Vol'
+    
+    def calculate_credit_regime(
+        self,
+        hy_oas: pd.Series,
+        ig_oas: pd.Series
+    ) -> str:
+        """
+        Classify credit regime based on spread levels.
+        """
+        current_hy = hy_oas.iloc[-1]
         
-        return {
-            'impulse': round(impulse, 2),
-            'signal': signal,
-            'hy_change': round(current_hy_change, 2),
-            'ig_change': round(current_ig_change, 2),
-        }
-
-
-# Singleton instance
-regime_service = RegimeService()
+        if current_hy < 300:
+            return 'Tight Credit'
+        elif current_hy < 500:
+            return 'Normal Credit'
+        elif current_hy < 800:
+            return 'Wide Credit'
+        else:
+            return 'Stress Credit'
