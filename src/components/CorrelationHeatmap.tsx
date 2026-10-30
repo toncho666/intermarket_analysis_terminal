@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { useTheme } from '../stores/theme';
 import { assets, getCorrelationMatrix } from '../data/marketData';
 import { useNavigate } from 'react-router-dom';
+import { Check, X } from 'lucide-react';
 
 interface Props {
   windowDays?: number;
@@ -13,17 +14,38 @@ export default function CorrelationHeatmap({ windowDays = 60, onWindowChange }: 
   const navigate = useNavigate();
   const isDark = theme === 'dark';
   const [hoveredCell, setHoveredCell] = useState<{ i: number; j: number } | null>(null);
-  const [filterClass, setFilterClass] = useState<string>('all');
+  const [selectedClasses, setSelectedClasses] = useState<string[]>(['all']);
   
   const windows = [20, 60, 250];
   const { matrix } = getCorrelationMatrix(windowDays);
   
-  // Filter assets by class
-  const filteredAssets = filterClass === 'all' 
-    ? assets 
-    : assets.filter(a => a.assetClass === filterClass);
+  // All available classes
+  const allClasses = ['equity', 'bond', 'credit', 'volatility', 'fx', 'commodity', 'crypto', 'index'];
+  
+  // Filter assets by selected classes
+  const filteredAssets = selectedClasses.includes('all')
+    ? assets
+    : assets.filter(a => selectedClasses.includes(a.assetClass));
   
   const filteredIndices = filteredAssets.map(a => assets.findIndex(ia => ia.id === a.id));
+  
+  // Toggle class selection
+  const toggleClass = (cls: string) => {
+    if (cls === 'all') {
+      setSelectedClasses(['all']);
+    } else {
+      const newSelection = selectedClasses.filter(c => c !== 'all');
+      if (newSelection.includes(cls)) {
+        const updated = newSelection.filter(c => c !== cls);
+        setSelectedClasses(updated.length === 0 ? ['all'] : updated);
+      } else {
+        setSelectedClasses([...newSelection, cls]);
+      }
+    }
+  };
+  
+  const selectAll = () => setSelectedClasses(allClasses);
+  const clearAll = () => setSelectedClasses(['all']);
   
   const getColor = (value: number) => {
     if (value >= 0.7) return isDark ? 'bg-green-500/80' : 'bg-green-500/70';
@@ -35,7 +57,19 @@ export default function CorrelationHeatmap({ windowDays = 60, onWindowChange }: 
     return isDark ? 'bg-red-500/80' : 'bg-red-500/70';
   };
   
-  const classes = ['all', 'equity', 'bond', 'credit', 'volatility', 'fx', 'commodity', 'crypto'];
+  const getClassColor = (cls: string) => {
+    const colors: Record<string, string> = {
+      equity: 'bg-blue-500',
+      bond: 'bg-purple-500',
+      credit: 'bg-orange-500',
+      volatility: 'bg-red-500',
+      fx: 'bg-teal-500',
+      commodity: 'bg-yellow-500',
+      crypto: 'bg-pink-500',
+      index: 'bg-indigo-500',
+    };
+    return colors[cls] || 'bg-gray-500';
+  };
 
   return (
     <div className={`rounded-2xl p-6 ${isDark ? 'bg-surface-2' : 'bg-white shadow-sm'}`}>
@@ -66,21 +100,78 @@ export default function CorrelationHeatmap({ windowDays = 60, onWindowChange }: 
         </div>
       </div>
       
-      {/* Class filter */}
-      <div className="flex gap-1.5 mb-4 flex-wrap">
-        {classes.map(c => (
+      {/* Multi-select class filter */}
+      <div className="mb-4">
+        <div className="flex items-center justify-between mb-2">
+          <span className={`text-xs font-medium ${isDark ? 'text-gray-500' : 'text-gray-400'}`}>
+            Asset Classes ({selectedClasses.includes('all') ? 'All' : selectedClasses.length} selected)
+          </span>
+          <div className="flex gap-2">
+            <button
+              onClick={selectAll}
+              className={`text-xs px-2 py-1 rounded transition-colors ${
+                isDark ? 'text-accent-blue hover:bg-surface-4' : 'text-accent-blue hover:bg-gray-100'
+              }`}
+            >
+              Select All
+            </button>
+            <button
+              onClick={clearAll}
+              className={`text-xs px-2 py-1 rounded transition-colors ${
+                isDark ? 'text-gray-400 hover:bg-surface-4' : 'text-gray-500 hover:bg-gray-100'
+              }`}
+            >
+              Clear
+            </button>
+          </div>
+        </div>
+        
+        <div className="flex gap-2 flex-wrap">
+          {/* All button */}
           <button
-            key={c}
-            onClick={() => setFilterClass(c)}
-            className={`px-2.5 py-1 text-xs rounded-full transition-colors ${
-              filterClass === c
-                ? 'bg-accent-blue text-white'
-                : isDark ? 'bg-surface-4 text-gray-400 hover:text-gray-200' : 'bg-gray-100 text-gray-600 hover:text-gray-900'
+            onClick={() => toggleClass('all')}
+            className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg border transition-all ${
+              selectedClasses.includes('all')
+                ? isDark
+                  ? 'border-accent-blue bg-accent-blue/10 text-accent-blue'
+                  : 'border-accent-blue bg-blue-50 text-accent-blue'
+                : isDark
+                  ? 'border-surface-4 text-gray-400 hover:border-surface-5'
+                  : 'border-gray-200 text-gray-600 hover:border-gray-300'
             }`}
           >
-            {c === 'all' ? 'All' : c.charAt(0).toUpperCase() + c.slice(1)}
+            {selectedClasses.includes('all') && <Check className="w-3 h-3" />}
+            All Classes
           </button>
-        ))}
+          
+          {/* Individual classes */}
+          {allClasses.map(cls => {
+            const isSelected = selectedClasses.includes(cls);
+            const count = assets.filter(a => a.assetClass === cls).length;
+            return (
+              <button
+                key={cls}
+                onClick={() => toggleClass(cls)}
+                className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg border transition-all ${
+                  isSelected
+                    ? isDark
+                      ? 'border-accent-blue bg-accent-blue/10 text-accent-blue'
+                      : 'border-accent-blue bg-blue-50 text-accent-blue'
+                    : isDark
+                      ? 'border-surface-4 text-gray-400 hover:border-surface-5'
+                      : 'border-gray-200 text-gray-600 hover:border-gray-300'
+                }`}
+              >
+                <div className={`w-2 h-2 rounded-full ${getClassColor(cls)}`} />
+                {cls.charAt(0).toUpperCase() + cls.slice(1)}
+                <span className={`text-[10px] ${isDark ? 'text-gray-600' : 'text-gray-400'}`}>
+                  ({count})
+                </span>
+                {isSelected && <Check className="w-3 h-3" />}
+              </button>
+            );
+          })}
+        </div>
       </div>
       
       {/* Heatmap */}
